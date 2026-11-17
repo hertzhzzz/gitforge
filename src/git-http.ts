@@ -273,6 +273,43 @@ function depthLimitedSet(
 }
 
 /** fetch 要发的对象、shallow 边界与 unshallow 列表。 */
+/**
+ * 客户端实际已有的对象：从 haves 出发可达的对象，但不越过 shallow 边界。
+ * 与 reachable() 不同：遇到 clientShallows 里的 commit 时，只收它本身及其
+ * tree/blob，不再跟进它的父提交（浅克隆的客户端并没有那些父提交）。
+ * deepen 的关键：客户端 have=[third] 且 shallow=[third] 时，它实际只有
+ * third 及其 tree/blob；用普通 reachable 会误以为它已有 second/tip，
+ * 导致 deepen 2 什么都不发。
+ */
+function clientHoldings(
+  objects: Map<string, { type: string; data: Buffer }>,
+  haves: string[],
+  shallowPoints: string[],
+): Set<string> {
+  const shallowSet = new Set(shallowPoints);
+  const seen = new Set<string>();
+  const stack = [...haves];
+  while (stack.length > 0) {
+    const sha = stack.pop() as string;
+    if (seen.has(sha)) continue;
+    seen.add(sha);
+    const object = objects.get(sha);
+    if (object === undefined) continue;
+    if (object.type === 'commit') {
+      const commit = parseCommit(object.data);
+      stack.push(commit.tree);
+      if (!shallowSet.has(sha)) {
+        for (const parent of commit.parents) stack.push(parent);
+      }
+    } else if (object.type === 'tree') {
+      for (const entry of parseTree(object.data)) stack.push(entry.oid);
+    } else if (object.type === 'tag') {
+      stack.push(parseTag(object.data).object);
+    }
+  }
+  return seen;
+}
+
 function computeFetch(
   objects: Map<string, { type: string; data: Buffer }>,
   wants: string[],
@@ -280,7 +317,7 @@ function computeFetch(
   clientShallows: string[],
   depth: number | undefined,
 ): { packObjects: Array<{ type: string; data: Buffer }>; sent: Set<string>; shallow: string[]; unshallow: string[] } {
-  const haveReachable = reachable(objects, haves);
+  const haveReachable = clientHoldings(objects, haves, clientShallows);
   const limited = depthLimitedSet(objects, wants, depth);
   const sent = new Set<string>();
   for (const sha of limited) {
@@ -366,13 +403,16 @@ function lsRefsResponse(
       );
     }
   } else if (unborn) {
+    // Real git 2.43 (verified): an empty repo advertises ONLY the unborn HEAD
+    // symref, never a separate `unborn refs/heads/<branch>` line. The extra
+    // line is parsed by clients as a real ref named refs/heads/<branch> with
+    // oid ZERO, which breaks clone-empty (it counts as an advertised ref)
+    // and breaks the GraphQL fixture push (it treats ZERO as an existing tip
+    // and tries to read its tree).
     if (matches('HEAD')) {
       parts.push(
         pktlineEncode(`unborn HEAD${symrefs ? ` symref-target:${headRef}` : ''}\n`),
       );
-    }
-    if (matches(headRef)) {
-      parts.push(pktlineEncode(`unborn ${headRef}\n`));
     }
   }
   for (const [ref, oid] of sortedRefs(repo)) {
